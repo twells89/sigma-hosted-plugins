@@ -194,10 +194,29 @@
   }
 
   // ---------------------------------------------------------------------
-  // Sigma client wiring (falls back to the synthetic preview when there is
-  // no host, e.g. this file opened directly in a browser tab).
+  // Sigma client wiring. Verified against @sigmacomputing/plugin v1.2.0
+  // (dist/umd + dist/esm/index.d.ts):
+  //   - The UMD build exposes its API as `window.SigmaPlugin` (not
+  //     `window.Sigma`). `.client` is the vanilla-JS bridge.
+  //   - Data subscription lives under `client.elements.subscribeToElementData
+  //     (sourceElementId, cb)` — it REQUIRES the source element id.
+  //   - We read bound column ids off the `client.config.subscribe(config => …)`
+  //     object (config.source / config.value / config.target are bare
+  //     ids/strings) so we also get re-notified when the binding changes.
+  //     (`client.config.getKey(k)` also returns the bare value at runtime —
+  //     despite its misleading `Pick<T,K>` type in the .d.ts — but doesn't
+  //     notify on change, so subscribe is the better fit here.)
+  // The `client` object exists even with no Sigma parent (opened standalone),
+  // so we paint the synthetic preview immediately and let real bound data
+  // overwrite it once the element-data subscription delivers.
   // ---------------------------------------------------------------------
-  var client = (typeof window.Sigma !== 'undefined' && window.Sigma.client) ? window.Sigma.client : null;
+  var s0 = synth();
+  render(s0.value, s0.target, '');   // immediate paint: standalone preview + pre-data placeholder
+
+  var client =
+    (window.SigmaPlugin && window.SigmaPlugin.client) ||   // real global (v1.2.0 UMD)
+    (window.Sigma && window.Sigma.client) ||               // legacy/alt global, just in case
+    null;
 
   if (client) {
     client.config.configureEditorPanel([
@@ -207,27 +226,34 @@
       { name: 'format', type: 'text' }
     ]);
 
-    client.subscribeToElementData(function (data) {
-      try {
-        var valueCol = client.config.getKey('value');
-        var targetCol = client.config.getKey('target');
-        var format = client.config.getKey('format');
-        var hasValue = data && valueCol && targetCol && data[valueCol] && data[targetCol] &&
-          data[valueCol].length && data[targetCol].length;
-        if (hasValue) {
-          render(Number(data[valueCol][0]), Number(data[targetCol][0]), format);
-        } else {
-          var s = synth();
-          render(s.value, s.target, format);
-        }
-      } catch (e) {
-        var fallback = synth();
-        render(fallback.value, fallback.target, '');
+    var unsubData = null;
+    client.config.subscribe(function (config) {
+      var sourceId = config && config.source;
+      if (unsubData) { unsubData(); unsubData = null; }   // re-subscribe if the source changes
+      if (!sourceId) {
+        var s = synth();
+        render(s.value, s.target, (config && config.format) || '');
+        return;
       }
+      unsubData = client.elements.subscribeToElementData(sourceId, function (data) {
+        try {
+          var valueCol = config.value;
+          var targetCol = config.target;
+          var fmt = config.format;
+          var hasValue = data && valueCol && targetCol && data[valueCol] && data[targetCol] &&
+            data[valueCol].length && data[targetCol].length;
+          if (hasValue) {
+            render(Number(data[valueCol][0]), Number(data[targetCol][0]), fmt);
+          } else {
+            var s = synth();
+            render(s.value, s.target, fmt);
+          }
+        } catch (e) {
+          var fb = synth();
+          render(fb.value, fb.target, '');
+        }
+      });
     });
-  } else {
-    var s = synth();
-    render(s.value, s.target, '');
   }
 
   // ResizeObserver on the render container -> full redraw. Mandatory: this
