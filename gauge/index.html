@@ -156,12 +156,15 @@
     var frac = target > 0 ? Math.max(0, Math.min(1, value / target)) : 0;
     var color = ragColor(frac);
 
-    // Fit a semicircle gauge inside the box, leaving headroom for labels.
+    // Fit the FULL semicircle inside the box. The dome rises from the baseline
+    // (cy) by the radius (r), so r must not exceed the vertical room ABOVE cy or
+    // the dome top clips off-canvas (the wide-short-panel bug). Constrain r by
+    // BOTH the half-width and (cy - pad); center horizontally.
     var cx = w / 2;
-    var r = Math.max(10, Math.min(w / 2 - 8, h * 0.78) - 4);
-    var cy = h * 0.62 - r * 0.0; // arc sits in the lower portion, dome up
-    cy = Math.min(h - 10, h * 0.7);
     var strokeWidth = Math.max(4, Math.min(w, h * 1.6) * 0.09);
+    var pad = strokeWidth / 2 + 4;              // keep the rounded stroke cap inside the box
+    var cy = Math.min(h - pad, h * 0.80);        // arc baseline, low in the box
+    var r = Math.max(10, Math.min(w / 2 - pad, cy - pad)); // full dome fits above cy AND within width
     var valueFontSize = Math.max(10, Math.min(w * 0.16, h * 0.34));
     var targetFontSize = Math.max(8, valueFontSize * 0.42);
 
