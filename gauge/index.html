@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<!--
+  gauge/index.html — clean-room WS2 "recreate-as-plugin" radial gauge.
+
+  A single-file, vanilla-JS Sigma custom plugin (@sigmacomputing/plugin) that
+  renders a value-vs-target radial (semicircle) gauge with RAG color, for
+  source vizzes (e.g. a QuickSight/Power BI gauge) that have no native Sigma
+  equivalent. Single responsibility: read {value, target} off a bound
+  element, draw the arc. No customer data anywhere in this file — the
+  standalone/synthetic preview uses generic literals (82 of 100).
+
+  Editor-panel contract (do not rename — this is what shared/lib/plugin_embed
+  binds and what the emitter/gap-scan machinery keys off of):
+    source  (type: element) — the bound data element
+    value   (type: column, source: 'source') — the current value
+    target  (type: column, source: 'source') — the target/goal
+    format  (type: text)    — optional number-format hint for the labels
+
+  Verified Sigma plugin-lifecycle gotchas encoded here (see
+  plugins/sigma-authoring/skills/sigma-plugin-authoring/reference/ once that
+  lands in a later task):
+    - ResizeObserver on the render container -> FULL redraw. This is the #1
+      cause of a "wonky" plugin: a plugin that only lets CSS/viewBox scaling
+      handle resize ends up with illegible text or a clipped arc at small
+      panel widths. Here every resize recomputes stroke-width/font-size from
+      the container's actual box and re-renders from scratch.
+    - A synthetic fallback (synth()) renders whenever `client` is unavailable
+      (no Sigma host — e.g. opening this file directly in a browser) or the
+      bound data is incomplete, so the plugin always previews standalone.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Gauge (value vs. target)</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #ffffff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  #gauge-root {
+    box-sizing: border-box;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+  #gauge-svg {
+    display: block;
+  }
+  #gauge-caption {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 6%;
+    text-align: center;
+    color: #6b7280;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="gauge-root">
+  <svg id="gauge-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+  <div id="gauge-caption"></div>
+</div>
+
+<script src="https://unpkg.com/@sigmacomputing/plugin"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------------
+  // Synthetic fallback — generic demo literals only, never customer data.
+  // Rendered whenever there is no Sigma client, or the bound data can't be
+  // read as a complete {value, target} pair.
+  // ---------------------------------------------------------------------
+  function synth() {
+    return { value: 82, target: 100 };
+  }
+
+  // ---------------------------------------------------------------------
+  // Small format helper for the value/target labels. Supports a lightweight
+  // subset of common hint strings via the optional `format` editor-panel
+  // field; anything unrecognized falls back to a plain grouped number.
+  // ---------------------------------------------------------------------
+  function formatNumber(n, fmt) {
+    var num = Number(n);
+    if (!isFinite(num)) return String(n);
+    var f = (fmt || '').trim();
+    if (f === '') return num.toLocaleString();
+    if (f.indexOf('%') !== -1) {
+      var pctMatch = f.match(/\.(\d+)/);
+      var pctDigits = pctMatch ? Number(pctMatch[1]) : 0;
+      return (num * 100).toFixed(pctDigits) + '%';
+    }
+    var fixedMatch = f.match(/\.(\d+)f/);
+    if (fixedMatch) return num.toFixed(Number(fixedMatch[1]));
+    if (f === 'd' || f === 'int') return Math.round(num).toLocaleString();
+    return num.toLocaleString();
+  }
+
+  // ---------------------------------------------------------------------
+  // Geometry: a 180-degree (semicircle) gauge swept left-to-right.
+  // ---------------------------------------------------------------------
+  function polarPoint(cx, cy, r, deg) {
+    var rad = ((deg - 180) * Math.PI) / 180;
+    return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
+  }
+
+  function arcPath(cx, cy, r, startDeg, endDeg) {
+    var start = polarPoint(cx, cy, r, endDeg);
+    var end = polarPoint(cx, cy, r, startDeg);
+    var large = (endDeg - startDeg) <= 180 ? 0 : 1;
+    return ['M', start.x, start.y, 'A', r, r, 0, large, 0, end.x, end.y].join(' ');
+  }
+
+  // RAG color from the value/target fraction.
+  function ragColor(frac) {
+    if (frac >= 1) return '#22c55e';   // green — at/above target
+    if (frac >= 0.6) return '#eab308'; // amber — approaching target
+    return '#ef4444';                  // red — well below target
+  }
+
+  // ---------------------------------------------------------------------
+  // Render: draws the full gauge into #gauge-svg at the CURRENT container
+  // size. Called on every data update AND on every resize (full redraw,
+  // not incremental) so text/stroke stay legible at any panel size.
+  // ---------------------------------------------------------------------
+  var lastValue = null;
+  var lastTarget = null;
+  var lastFormat = '';
+
+  function render(value, target, fmt) {
+    lastValue = value;
+    lastTarget = target;
+    lastFormat = fmt || '';
+
+    var root = document.getElementById('gauge-root');
+    var svg = document.getElementById('gauge-svg');
+    var caption = document.getElementById('gauge-caption');
+
+    var box = root.getBoundingClientRect();
+    var w = Math.max(60, box.width);
+    var h = Math.max(40, box.height);
+    svg.setAttribute('width', w);
+    svg.setAttribute('height', h);
+    svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+
+    var frac = target > 0 ? Math.max(0, Math.min(1, value / target)) : 0;
+    var color = ragColor(frac);
+
+    // Fit a semicircle gauge inside the box, leaving headroom for labels.
+    var cx = w / 2;
+    var r = Math.max(10, Math.min(w / 2 - 8, h * 0.78) - 4);
+    var cy = h * 0.62 - r * 0.0; // arc sits in the lower portion, dome up
+    cy = Math.min(h - 10, h * 0.7);
+    var strokeWidth = Math.max(4, Math.min(w, h * 1.6) * 0.09);
+    var valueFontSize = Math.max(10, Math.min(w * 0.16, h * 0.34));
+    var targetFontSize = Math.max(8, valueFontSize * 0.42);
+
+    var track = arcPath(cx, cy, r, 0, 180);
+    var fill = arcPath(cx, cy, r, 0, 180 * frac);
+
+    var valueLabel = formatNumber(value, fmt);
+    var targetLabel = formatNumber(target, fmt);
+
+    svg.innerHTML =
+      '<path d="' + track + '" stroke="#e5e7eb" stroke-width="' + strokeWidth +
+        '" fill="none" stroke-linecap="round"/>' +
+      '<path d="' + fill + '" stroke="' + color + '" stroke-width="' + strokeWidth +
+        '" fill="none" stroke-linecap="round"/>' +
+      '<text x="' + cx + '" y="' + (cy - r * 0.15) + '" text-anchor="middle" ' +
+        'font-size="' + valueFontSize + '" font-weight="600" fill="#111827">' + valueLabel + '</text>' +
+      '<text x="' + cx + '" y="' + (cy - r * 0.15 + targetFontSize + 4) + '" text-anchor="middle" ' +
+        'font-size="' + targetFontSize + '" fill="#6b7280">of ' + targetLabel + '</text>';
+
+    caption.textContent = '';
+  }
+
+  function redrawFromLastKnown() {
+    var v = lastValue === null ? synth().value : lastValue;
+    var t = lastTarget === null ? synth().target : lastTarget;
+    render(v, t, lastFormat);
+  }
+
+  // ---------------------------------------------------------------------
+  // Sigma client wiring (falls back to the synthetic preview when there is
+  // no host, e.g. this file opened directly in a browser tab).
+  // ---------------------------------------------------------------------
+  var client = (typeof window.Sigma !== 'undefined' && window.Sigma.client) ? window.Sigma.client : null;
+
+  if (client) {
+    client.config.configureEditorPanel([
+      { name: 'source', type: 'element' },
+      { name: 'value', type: 'column', source: 'source', allowMultiple: false },
+      { name: 'target', type: 'column', source: 'source', allowMultiple: false },
+      { name: 'format', type: 'text' }
+    ]);
+
+    client.subscribeToElementData(function (data) {
+      try {
+        var valueCol = client.config.getKey('value');
+        var targetCol = client.config.getKey('target');
+        var format = client.config.getKey('format');
+        var hasValue = data && valueCol && targetCol && data[valueCol] && data[targetCol] &&
+          data[valueCol].length && data[targetCol].length;
+        if (hasValue) {
+          render(Number(data[valueCol][0]), Number(data[targetCol][0]), format);
+        } else {
+          var s = synth();
+          render(s.value, s.target, format);
+        }
+      } catch (e) {
+        var fallback = synth();
+        render(fallback.value, fallback.target, '');
+      }
+    });
+  } else {
+    var s = synth();
+    render(s.value, s.target, '');
+  }
+
+  // ResizeObserver on the render container -> full redraw. Mandatory: this
+  // is what keeps the gauge legible as the panel is resized in the Sigma
+  // workbook editor, rather than just letting the SVG stretch.
+  new ResizeObserver(function () {
+    redrawFromLastKnown();
+  }).observe(document.getElementById('gauge-root'));
+})();
+</script>
+</body>
+</html>
