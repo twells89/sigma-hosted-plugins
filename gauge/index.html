@@ -71,6 +71,17 @@
   <div id="gauge-caption"></div>
 </div>
 
+<!--
+  REQUIRED: load React BEFORE the SDK. @sigmacomputing/plugin's UMD build has
+  React as a hard peer dependency — its factory dereferences React at load and,
+  if React is absent, THROWS before assigning `client`, leaving
+  window.SigmaPlugin with NO `client`. The plugin then can never read bound data
+  and silently falls back to synth() (looks like it works, shows demo numbers).
+  Sigma does NOT inject React into the plugin iframe, so the plugin must load it
+  itself. ReactDOM is NOT needed for the vanilla client API. Verified against
+  @sigmacomputing/plugin v1.2.0 (see reference/plugin-lifecycle.md).
+-->
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/@sigmacomputing/plugin"></script>
 <script>
 (function () {
