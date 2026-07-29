@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Modal Shift Lane Ladder — Sigma Plugin</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,Inter,"Segoe UI",Roboto,Arial,sans-serif;
+    background:transparent;overflow:hidden;
+  }
+  #stage{height:100%;width:100%;display:flex;flex-direction:column;padding:12px 14px;gap:8px;overflow:hidden}
+
+  /* header */
+  #head{flex:0 0 auto;display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap;min-width:0}
+  #ttl{font-size:12px;font-weight:800;letter-spacing:.06em;text-transform:uppercase}
+  #chips{display:flex;gap:12px;font-size:11px;opacity:.72;flex-wrap:wrap}
+  #chips b{opacity:1;font-weight:700}
+  #badge{
+    font-size:9px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;
+    padding:2px 6px;border-radius:3px;border:1px solid currentColor;opacity:.85;display:none;
+  }
+
+  /* ladder */
+  #ladder{flex:1;display:grid;gap:2px;min-height:0;min-width:0;align-content:stretch}
+  .row{display:grid;align-items:center;gap:10px;min-height:0;min-width:0;padding:0 0 0 7px;border-left:3px solid transparent}
+  .row.flag{border-left-color:var(--flag)}
+  /* Only the lane NAME may ellipsize — the volume and the shift chip are
+     flex:0 0 auto so they are never clipped out of the row. */
+  .lane{display:flex;align-items:center;gap:5px;min-width:0;font-size:11px;font-weight:600}
+  .lane .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .lane .vol{flex:0 0 auto;font-weight:400;opacity:.55;font-size:10px;font-variant-numeric:tabular-nums}
+  .bar{display:flex;height:14px;border-radius:3px;overflow:hidden;background:rgba(127,127,127,.14);cursor:default}
+  .seg{display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:#fff;min-width:0;transition:filter .1s}
+  .seg:hover{filter:brightness(1.12)}
+  .mx{display:flex;gap:10px;justify-content:flex-end;font-size:10px;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .mx span{opacity:.75}
+  .mx b{font-weight:700}
+  .chip{
+    flex:0 0 auto;
+    font-size:8px;font-weight:800;letter-spacing:.06em;padding:1px 4px;border-radius:2px;
+    color:#fff;background:var(--flag);
+  }
+
+  /* legend — min-width:0 + wrap so a long legend can never force #stage
+     wider than the panel (that overflow pushes the bars off the right edge). */
+  #legend{flex:0 0 auto;display:flex;align-items:center;gap:14px;font-size:10px;opacity:.6;
+          min-width:0;flex-wrap:wrap;overflow:hidden}
+  #legend>span{white-space:nowrap}
+  #legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+
+  #tip{
+    position:fixed;pointer-events:none;z-index:20;opacity:0;transition:opacity .1s;
+    background:#111827;color:#f9fafb;border-radius:7px;padding:7px 9px;font-size:11px;
+    white-space:nowrap;box-shadow:0 8px 24px rgba(0,0,0,.35);line-height:1.45;
+  }
+  #tip b{color:#fff}
+  #tip .k{opacity:.65}
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="head">
+    <div style="display:flex;align-items:center;gap:8px">
+      <div id="ttl">Modal shift opportunity</div>
+      <div id="badge">sample data</div>
+    </div>
+    <div id="chips"></div>
+  </div>
+  <div id="ladder"></div>
+  <div id="legend"></div>
+</div>
+<div id="tip"></div>
+
+<!--
+  REQUIRED: load React BEFORE the SDK. @sigmacomputing/plugin's UMD build has
+  React as a hard peer dependency — its factory dereferences React at load and,
+  if React is absent, THROWS before assigning `client`, leaving
+  window.SigmaPlugin with NO `client`. The plugin then can never read bound data
+  and silently falls back to synth() (looks like it works, shows demo numbers).
+  Sigma does NOT inject React into the plugin iframe, so the plugin must load it
+  itself. ReactDOM is NOT needed for the vanilla client API.
+  Both files are vendored (not CDN) so the bundle keeps working if unpkg is
+  unreachable from either a browser or Sigma's server-side render service.
+-->
+<script src="./react.production.min.js"></script>
+<script src="./sigmacomputing-plugin.umd.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var client =
+    (window.SigmaPlugin && window.SigmaPlugin.client) ||                 // UMD global (v1.2.0)
+    (window.sigmaComputing && window.sigmaComputing.plugin &&
+     window.sigmaComputing.plugin.client) ||                             // older global, defensive
+    null;
+
+  // Neutral defaults. Brand colors are passed per-embed from the workbook spec
+  // so nothing customer-specific lives in this public bundle.
+  var DEF = {
+    truck: '#94A3B8',
+    rail:  '#0EA5A4',
+    flag:  '#DC2626',
+    ink:   '#0F172A',
+    maxLanes: 8,
+    sortBy: 'Opportunity',
+    flagThreshold: 85
+  };
+
+  var PANEL = [
+    { name:'source',         type:'element' },
+    { name:'lane',           type:'column', source:'source', allowedTypes:['text'],              label:'Lane' },
+    { name:'truckLoads',     type:'column', source:'source', allowedTypes:['number','integer'],  label:'Truck loads' },
+    { name:'railLoads',      type:'column', source:'source', allowedTypes:['number','integer'],  label:'Intermodal loads' },
+    { name:'savingsPerMile', type:'column', source:'source', allowedTypes:['number','integer'],  label:'Savings per mile ($) — optional' },
+    { name:'co2Avoided',     type:'column', source:'source', allowedTypes:['number','integer'],  label:'CO2 avoided (kg) — optional' },
+    { name:'sortBy',         type:'dropdown', values:['Opportunity','Volume','CO2 avoided'],     label:'Rank lanes by' },
+    { name:'maxLanes',       type:'dropdown', values:['5','6','8','10','12','16'],               label:'Max lanes shown' },
+    { name:'flagThreshold',  type:'dropdown', values:['70','75','80','85','90'],                 label:'Flag truck share above (%)' },
+    { name:'truckColor',     type:'color',  label:'Truck color' },
+    { name:'railColor',      type:'color',  label:'Intermodal color' },
+    { name:'flagColor',      type:'color',  label:'Flag color' },
+    { name:'inkColor',       type:'color',  label:'Text color' }
+  ];
+  if (client) client.config.configureEditorPanel(PANEL);
+
+  // ---------------------------------------------------------------------
+  // formatting
+  // ---------------------------------------------------------------------
+  // num() spans magnitudes (CO2 kg: 400k .. 2.1M). count() stays comma-grouped
+  // so a column of 4-5 digit load counts reads consistently instead of mixing
+  // "9,300" and "13k" in the same column.
+  function num(v) {
+    v = Math.round(Number(v) || 0);
+    if (Math.abs(v) >= 1e9) return (v / 1e9).toFixed(1) + 'B';
+    if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+    if (Math.abs(v) >= 1e4) return Math.round(v / 1e3) + 'k';
+    return v.toLocaleString('en-US');
+  }
+  function count(v) {
+    v = Math.round(Number(v) || 0);
+    if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+    return v.toLocaleString('en-US');
+  }
+  function money(v) {
+    v = Number(v) || 0;
+    return '$' + (Math.abs(v) < 10 ? v.toFixed(2) : num(v));
+  }
+  function pct(v) { return (Math.round(v * 1000) / 10).toFixed(1) + '%'; }
+
+  // ---------------------------------------------------------------------
+  // Synthetic fallback — generic demo literals only, never customer data.
+  // Shown whenever there is no client or the binding can't be read. The
+  // "sample data" badge stays visible in that state on purpose: synthetic
+  // numbers that look plausible are exactly how a broken column binding
+  // hides itself.
+  // ---------------------------------------------------------------------
+  function synth() {
+    var seed = [
+      ['Chicago, IL → Houston, TX',  8400, 4700, 0.42, 1240000],
+      ['Atlanta, GA → Newark, NJ',    5100, 7300, 0.31,  840000],
+      ['Los Angeles, CA → Phoenix, AZ', 9600, 820, 0.55, 2110000],
+      ['Dallas, TX → Memphis, TN',    6200, 3100, 0.38,  760000],
+      ['Seattle, WA → Denver, CO',    4300, 2900, 0.47,  610000],
+      ['Detroit, MI → Charlotte, NC', 7100, 1200, 0.29,  430000],
+      ['Kansas City, MO → Reno, NV',  3300, 4100, 0.51,  980000],
+      ['Savannah, GA → Columbus, OH', 5800, 2200, 0.35,  520000]
+    ];
+    return seed.map(function (r) {
+      return { lane:r[0], truck:r[1], rail:r[2], spm:r[3], co2:r[4], hasSpm:true, hasCo2:true };
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // Read the bound element data into lane rows. Sigma hands back an object
+  // keyed by columnId -> array of values, so multiple warehouse rows per lane
+  // are summed here rather than assumed pre-aggregated.
+  // ---------------------------------------------------------------------
+  function fromData(cfg, data) {
+    if (!data || !cfg.lane || !cfg.truckLoads || !cfg.railLoads) return null;
+    var lane = data[cfg.lane], truck = data[cfg.truckLoads], rail = data[cfg.railLoads];
+    if (!lane || !truck || !rail || !lane.length) return null;
+
+    var spm = (cfg.savingsPerMile && data[cfg.savingsPerMile]) || null;
+    var co2 = (cfg.co2Avoided     && data[cfg.co2Avoided])     || null;
+
+    var by = {}, order = [];
+    for (var i = 0; i < lane.length; i++) {
+      var k = String(lane[i] == null ? '' : lane[i]);
+      if (!k) continue;
+      if (!by[k]) { by[k] = { lane:k, truck:0, rail:0, spmW:0, spmN:0, co2:0, hasSpm:!!spm, hasCo2:!!co2 }; order.push(k); }
+      var row = by[k];
+      var t = Number(truck[i]) || 0;
+      row.truck += t;
+      row.rail  += Number(rail[i]) || 0;
+      if (spm) { var w = t || 1; row.spmW += (Number(spm[i]) || 0) * w; row.spmN += w; }
+      if (co2) { row.co2 += Number(co2[i]) || 0; }
+    }
+    var out = order.map(function (k) {
+      var r = by[k];
+      r.spm = r.spmN ? r.spmW / r.spmN : 0;
+      return r;
+    }).filter(function (r) { return (r.truck + r.rail) > 0; });
+
+    return out.length ? out : null;
+  }
+
+  function rank(rows, sortBy) {
+    var key = sortBy === 'Volume'       ? function (r) { return r.truck + r.rail; }
+            : sortBy === 'CO2 avoided'  ? function (r) { return r.co2; }
+            : /* Opportunity */           function (r) { return r.truck; };
+    return rows.slice().sort(function (a, b) { return key(b) - key(a); });
+  }
+
+  // ---------------------------------------------------------------------
+  // render — reads its own size fresh every call (see the ResizeObserver
+  // below). Sigma sizes the panel AFTER first paint, so a load-time-only
+  // measurement draws at a stale size and clips rows.
+  // ---------------------------------------------------------------------
+  var tip = document.getElementById('tip');
+  var ladderEl = document.getElementById('ladder');
+
+  function showTip(e, html) {
+    tip.innerHTML = html;
+    tip.style.opacity = 1;
+    var pad = 14, w = tip.offsetWidth, h = tip.offsetHeight;
+    var x = e.clientX + pad, y = e.clientY + pad;
+    if (x + w > window.innerWidth)  x = e.clientX - w - pad;
+    if (y + h > window.innerHeight) y = e.clientY - h - pad;
+    tip.style.left = Math.max(2, x) + 'px';
+    tip.style.top  = Math.max(2, y) + 'px';
+  }
+  function hideTip() { tip.style.opacity = 0; }
+
+  function render(rows, isSynth, opt) {
+    var stage = document.getElementById('stage');
+    document.body.style.color = opt.ink;
+    stage.style.setProperty('--flag', opt.flag);
+    document.getElementById('badge').style.display = isSynth ? 'block' : 'none';
+
+    var W = stage.clientWidth || 640;
+    var compact = W < 560;          // drop the right-hand metric column
+    var tight   = W < 400;          // drop the in-bar percentage labels
+
+    // Fit the row count to the space actually available, so rows are never
+    // clipped or overlapped on a short panel.
+    var avail = ladderEl.clientHeight || Math.max(60, (stage.clientHeight || 240) - 62);
+    var fits  = Math.max(1, Math.floor(avail / 30));
+    var shown = rank(rows, opt.sortBy).slice(0, Math.min(opt.maxLanes, fits));
+
+    var laneW = tight ? 112 : compact ? 152 : 228;
+    var mxW   = compact ? 0 : 142;
+    var cols  = laneW + 'px 1fr' + (mxW ? ' ' + mxW + 'px' : '');
+
+    ladderEl.style.gridTemplateRows = 'repeat(' + shown.length + ', 1fr)';
+    ladderEl.innerHTML = '';
+
+    shown.forEach(function (r) {
+      var total = r.truck + r.rail;
+      var tShare = total ? r.truck / total : 0;
+      var flagged = tShare * 100 >= opt.flagThreshold;
+
+      var row = document.createElement('div');
+      row.className = 'row' + (flagged ? ' flag' : '');
+      row.style.gridTemplateColumns = cols;
+
+      var lane = document.createElement('div');
+      lane.className = 'lane';
+      lane.innerHTML = '<span class="nm">' + escapeHtml(r.lane) + '</span>' +
+        (tight ? '' : '<span class="vol">' + count(total) + '</span>') +
+        (flagged ? '<span class="chip">shift</span>' : '');
+      lane.title = r.lane;
+      row.appendChild(lane);
+
+      var bar = document.createElement('div');
+      bar.className = 'bar';
+      [['truck', r.truck, opt.truck, 'Truck'], ['rail', r.rail, opt.rail, 'Intermodal']]
+        .forEach(function (s) {
+          var share = total ? s[1] / total : 0;
+          if (share <= 0) return;
+          var seg = document.createElement('div');
+          seg.className = 'seg';
+          seg.style.flex = share;
+          seg.style.background = s[2];
+          seg.textContent = (!tight && share > 0.14) ? Math.round(share * 100) + '%' : '';
+          seg.addEventListener('mousemove', function (e) {
+            showTip(e,
+              '<b>' + escapeHtml(r.lane) + '</b><br>' +
+              s[3] + ' <b>' + count(s[1]) + '</b> loads <span class="k">(' + pct(share) + ')</span><br>' +
+              '<span class="k">Total</span> ' + count(total) + ' loads' +
+              (r.hasSpm ? '<br><span class="k">Savings</span> ' + money(r.spm) + '/mi' : '') +
+              (r.hasCo2 ? '<br><span class="k">CO₂ avoided</span> ' + num(r.co2) + ' kg' : ''));
+          });
+          seg.addEventListener('mouseleave', hideTip);
+          bar.appendChild(seg);
+        });
+      row.appendChild(bar);
+
+      if (mxW) {
+        var mx = document.createElement('div');
+        mx.className = 'mx';
+        var bits = [];
+        if (r.hasSpm) bits.push('<span>' + money(r.spm) + '/mi</span>');
+        if (r.hasCo2) bits.push('<b>' + num(r.co2) + '</b><span>&nbsp;kg CO₂</span>');
+        mx.innerHTML = bits.join('');
+        row.appendChild(mx);
+      }
+
+      ladderEl.appendChild(row);
+    });
+
+    // summary chips over ALL ranked lanes, not just the visible slice
+    var all = rank(rows, opt.sortBy);
+    var tT = 0, tR = 0, tC = 0, sW = 0, sN = 0, anySpm = false, anyCo2 = false;
+    all.forEach(function (r) {
+      tT += r.truck; tR += r.rail; tC += r.co2;
+      if (r.hasSpm) { anySpm = true; sW += r.spm * r.truck; sN += r.truck; }
+      if (r.hasCo2) { anyCo2 = true; }
+    });
+    var grand = tT + tR;
+    var chips = [
+      '<span>' + all.length + ' lanes</span>',
+      '<span>intermodal <b>' + (grand ? pct(tR / grand) : '—') + '</b></span>'
+    ];
+    if (anySpm && sN) chips.push('<span>avg <b>' + money(sW / sN) + '</b>/mi</span>');
+    if (anyCo2)       chips.push('<span><b>' + num(tC) + '</b> kg CO₂ avoided</span>');
+    // Truncation lives in the header, not the legend: on a short panel the
+    // legend can fall outside the frame, which would hide the fact that only
+    // some of the lanes are on screen.
+    if (shown.length < all.length) {
+      chips.push('<span>showing top <b>' + shown.length + '</b></span>');
+    }
+    document.getElementById('chips').innerHTML = chips.join('');
+
+    document.getElementById('legend').innerHTML =
+      '<span><i style="background:' + opt.truck + '"></i>Truck</span>' +
+      '<span><i style="background:' + opt.rail + '"></i>Intermodal</span>' +
+      '<span><i style="background:' + opt.flag + '"></i>' +
+        (compact ? '≥' + opt.flagThreshold + '% truck'
+                 : 'Truck share ≥ ' + opt.flagThreshold + '% — shift candidate') + '</span>';
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // state + redraw wiring
+  // ---------------------------------------------------------------------
+  var st = { cfg: {}, data: null, unsub: null };
+
+  function opts(cfg) {
+    var n = function (v, d) { var x = parseInt(v, 10); return isNaN(x) ? d : x; };
+    return {
+      truck: cfg.truckColor || DEF.truck,
+      rail:  cfg.railColor  || DEF.rail,
+      flag:  cfg.flagColor  || DEF.flag,
+      ink:   cfg.inkColor   || DEF.ink,
+      sortBy: cfg.sortBy || DEF.sortBy,
+      maxLanes: n(cfg.maxLanes, DEF.maxLanes),
+      flagThreshold: n(cfg.flagThreshold, DEF.flagThreshold)
+    };
+  }
+
+  function draw() {
+    var cfg = st.cfg || {};
+    var rows = fromData(cfg, st.data);
+    render(rows || synth(), !rows, opts(cfg));
+  }
+
+  if (client) {
+    client.config.subscribe(function (cfg) {
+      st.cfg = cfg || {};
+      if (st.unsub) { st.unsub(); st.unsub = null; }
+      if (st.cfg.source) {
+        st.unsub = client.elements.subscribeToElementData(st.cfg.source, function (d) {
+          st.data = d;
+          draw();
+        });
+      } else {
+        st.data = null;
+      }
+      draw();
+    });
+  }
+
+  draw();
+  if (window.ResizeObserver) new ResizeObserver(draw).observe(document.getElementById('stage'));
+  window.addEventListener('resize', draw);
+})();
+</script>
+</body>
+</html>
