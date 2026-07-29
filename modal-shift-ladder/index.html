@@ -372,12 +372,23 @@
     render(rows || synth(), !rows, opts(cfg));
   }
 
+  // A UI-bound source arrives as a bare element-id string, but a spec-authored
+  // one can arrive as the object the spec declared ({kind:"element",elementId}).
+  // Passing that object to subscribeToElementData subscribes to nothing and the
+  // plugin silently falls back to synth, so normalize to the id either way.
+  function sourceId(src) {
+    if (!src) return null;
+    if (typeof src === 'string') return src;
+    return src.elementId || src.id || src.element || null;
+  }
+
   if (client) {
     client.config.subscribe(function (cfg) {
       st.cfg = cfg || {};
       if (st.unsub) { st.unsub(); st.unsub = null; }
-      if (st.cfg.source) {
-        st.unsub = client.elements.subscribeToElementData(st.cfg.source, function (d) {
+      var sid = sourceId(st.cfg.source);
+      if (sid) {
+        st.unsub = client.elements.subscribeToElementData(sid, function (d) {
           st.data = d;
           draw();
         });
