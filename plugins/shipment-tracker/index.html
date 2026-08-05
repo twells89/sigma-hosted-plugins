@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Live Shipment Tracker</title>
+<script crossorigin src="react.production.min.js"></script>
+<script src="sigmacomputing-plugin.umd.js"></script>
+<script src="d3.min.js"></script>
+<script src="topojson-client.min.js"></script>
+<style>
+  :root {
+    --ink:#142A46; --muted:#9CA3AF; --line:#e6e9ef; --bg:#f7f9fc;
+    --transit:#289DD7; --delayed:#D7263D; --soon:#F2A93B; --delivered:#2CA171;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:var(--ink); background:#fff; }
+  #stage { position:relative; width:100%; height:100vh; overflow:hidden; background:linear-gradient(180deg,#fbfcfe 0%, #f3f6fb 100%); }
+  svg { width:100%; height:100%; display:block; }
+  .state { fill:#eef2f8; stroke:#dfe5ee; stroke-width:.6px; }
+  .route { fill:none; stroke-linecap:round; opacity:.35; }
+  .route.transit { stroke:var(--transit); }
+  .route.delayed { stroke:var(--delayed); }
+  .route.soon    { stroke:var(--soon); }
+  .dc { stroke:#fff; stroke-width:1px; }
+  .truck { cursor:pointer; }
+  .truck-halo { opacity:.18; }
+  /* overlay UI */
+  .panel { position:absolute; backdrop-filter:blur(6px); background:rgba(255,255,255,.86); border:1px solid var(--line); border-radius:14px; box-shadow:0 6px 22px rgba(30,53,88,.08); }
+  #hud { top:14px; left:14px; padding:12px 14px; min-width:210px; }
+  #hud h1 { margin:0 0 2px; font-size:13px; letter-spacing:.02em; text-transform:uppercase; color:var(--muted); font-weight:700; }
+  #hud .big { font-size:30px; font-weight:800; line-height:1.05; }
+  #hud .sub { font-size:12px; color:var(--muted); margin-top:2px; }
+  #legend { top:14px; right:14px; padding:10px 12px; font-size:12px; }
+  #legend .row { display:flex; align-items:center; gap:8px; margin:3px 0; }
+  #legend .dot { width:11px; height:11px; border-radius:50%; }
+  #legend b { font-variant-numeric:tabular-nums; }
+  #stats { bottom:14px; left:14px; right:14px; display:flex; gap:10px; padding:10px 12px; justify-content:space-between; }
+  #stats .cell { flex:1; text-align:center; }
+  #stats .k { font-size:22px; font-weight:800; font-variant-numeric:tabular-nums; }
+  #stats .l { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  #stats .cell + .cell { border-left:1px solid var(--line); }
+  #tip { position:absolute; pointer-events:none; z-index:20; background:#0f1b2d; color:#fff; padding:9px 11px; border-radius:10px; font-size:12px; line-height:1.45; max-width:250px; opacity:0; transition:opacity .12s; box-shadow:0 8px 24px rgba(0,0,0,.28); }
+  #tip .id { font-weight:800; font-size:13px; }
+  #tip .pill { display:inline-block; padding:1px 7px; border-radius:20px; font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.03em; color:#fff; margin-left:6px; }
+  #tip .kv { color:#c8d2e0; }
+  #msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:14px; text-align:center; padding:24px; }
+  .bar { height:5px; border-radius:4px; background:rgba(255,255,255,.22); margin-top:6px; overflow:hidden; }
+  .bar > i { display:block; height:100%; border-radius:4px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <svg id="map"></svg>
+  <div id="hud" class="panel">
+    <h1>Active Shipments</h1>
+    <div class="big" id="hud-active">—</div>
+    <div class="sub" id="hud-sub">Live network view</div>
+  </div>
+  <div id="legend" class="panel">
+    <div class="row"><span class="dot" style="background:var(--transit)"></span> In Transit <b id="lg-transit">0</b></div>
+    <div class="row"><span class="dot" style="background:var(--soon)"></span> Arriving soon <b id="lg-soon">0</b></div>
+    <div class="row"><span class="dot" style="background:var(--delayed)"></span> Delayed <b id="lg-delayed">0</b></div>
+  </div>
+  <div id="stats" class="panel">
+    <div class="cell"><div class="k" id="st-units">—</div><div class="l">Units in transit</div></div>
+    <div class="cell"><div class="k" id="st-ontime">—</div><div class="l">On-time pace</div></div>
+    <div class="cell"><div class="k" id="st-eta">—</div><div class="l">Next ETA</div></div>
+    <div class="cell"><div class="k" id="st-carriers">—</div><div class="l">Carriers</div></div>
+  </div>
+  <div id="tip"></div>
+  <div id="msg">Loading map…</div>
+</div>
+<script>
+(function(){
+  "use strict";
+  var client = (window.SigmaPlugin && window.SigmaPlugin.client) ||
+               (window.sigmaComputing && window.sigmaComputing.plugin && window.sigmaComputing.plugin.client) || null;
+
+  var COLORS = { transit:"#289DD7", soon:"#F2A93B", delayed:"#D7263D", delivered:"#2CA171" };
+
+  // Editor panel — every binding is a column string except `source`.
+  if (client) {
+    client.config.configureEditorPanel([
+      { name:"source", type:"element" },
+      { name:"shipmentId", type:"column", source:"source", allowMultiple:false, label:"Shipment ID" },
+      { name:"oLat", type:"column", source:"source", allowMultiple:false, label:"Origin Lat" },
+      { name:"oLng", type:"column", source:"source", allowMultiple:false, label:"Origin Lng" },
+      { name:"dLat", type:"column", source:"source", allowMultiple:false, label:"Dest Lat" },
+      { name:"dLng", type:"column", source:"source", allowMultiple:false, label:"Dest Lng" },
+      { name:"status", type:"column", source:"source", allowMultiple:false, label:"Live Status" },
+      { name:"progress", type:"column", source:"source", allowMultiple:false, label:"Transit Progress" },
+      { name:"eta", type:"column", source:"source", allowMultiple:false, label:"ETA" },
+      { name:"carrier", type:"column", source:"source", allowMultiple:false, label:"Carrier" },
+      { name:"units", type:"column", source:"source", allowMultiple:false, label:"Units" },
+      { name:"city", type:"column", source:"source", allowMultiple:false, label:"Dest City" },
+      { name:"state", type:"column", source:"source", allowMultiple:false, label:"Dest State" },
+      { name:"category", type:"column", source:"source", allowMultiple:false, label:"Category" }
+    ]);
+  }
+
+  var svg = d3.select("#map"), gStates, gRoutes, gTrucks, gDC, projection, path;
+  var us = null, rows = [], animT = 0, raf = null, lastCfg = null, lastData = null, lastCols = null;
+  var tip = document.getElementById("tip"), msg = document.getElementById("msg");
+
+  // ---- helpers ----
+  function num(v){ if (v===null||v===undefined) return null; var n = (typeof v==="number")? v : parseFloat(String(v)); return isNaN(n)?null:n; }
+  function classify(statusRaw, prog){
+    var s = String(statusRaw||"").toLowerCase();
+    if (s.indexOf("delay")>=0) return "delayed";
+    if (s.indexOf("deliver")>=0) return "delivered";
+    if (prog!=null && prog>=0.8) return "soon";
+    return "transit";
+  }
+  function fmtETA(v){
+    if (v==null||v==="") return "—";
+    var d = (typeof v==="number") ? new Date(v<1e11? v*1000 : v) : new Date(String(v));
+    if (isNaN(d.getTime())) return String(v).slice(0,10);
+    return d.toLocaleDateString(undefined,{month:"short", day:"numeric"});
+  }
+  function etaMs(v){
+    if (v==null||v==="") return Infinity;
+    var d = (typeof v==="number") ? new Date(v<1e11? v*1000 : v) : new Date(String(v));
+    return isNaN(d.getTime()) ? Infinity : d.getTime();
+  }
+
+  function buildRows(cfg, data, cols){
+    if (!cfg || !cfg.source || !data) return [];
+    function col(key){ var id = cfg[key]; return (id && data[id]) ? data[id] : null; }
+    var dLat = col("dLat"), dLng = col("dLng");
+    if (!dLat || !dLng) return [];
+    var n = dLat.length;
+    var oLat=col("oLat"), oLng=col("oLng"), id=col("shipmentId"), st=col("status"),
+        pr=col("progress"), eta=col("eta"), car=col("carrier"), un=col("units"),
+        cy=col("city"), stt=col("state"), cat=col("category");
+    var out=[];
+    for (var i=0;i<n;i++){
+      var dla=num(dLat[i]), dln=num(dLng[i]);
+      if (dla==null||dln==null) continue;
+      var prog = pr? num(pr[i]) : null;
+      var cls = classify(st?st[i]:null, prog);
+      if (cls==="delivered") continue;               // map = active shipments only
+      var ola = oLat? num(oLat[i]) : null, oln = oLng? num(oLng[i]) : null;
+      if (ola==null||oln==null){ ola = 39.5; oln = -98.35; } // US centroid fallback
+      out.push({
+        id: id? id[i] : ("SHP-"+i),
+        o:[oln,ola], d:[dln,dla],
+        cls: cls, prog: (prog==null?0.5:Math.max(0,Math.min(1,prog))),
+        eta: eta? eta[i] : null, carrier: car? car[i] : "—",
+        units: un? (num(un[i])||0) : 0, city: cy? cy[i] : "", state: stt? stt[i] : "",
+        category: cat? cat[i] : ""
+      });
+    }
+    // keep the map legible: closest ETAs first, cap the fleet drawn
+    out.sort(function(a,b){ return etaMs(a.eta)-etaMs(b.eta); });
+    return out.slice(0, 260);
+  }
+
+  function fit(){
+    var stage = document.getElementById("stage");
+    var w = stage.clientWidth||900, h = stage.clientHeight||600;
+    svg.attr("viewBox","0 0 "+w+" "+h);
+    if (!us) return {w:w,h:h};
+    var land = topojson.feature(us, us.objects.states);
+    projection = d3.geoAlbersUsa().fitExtent([[20,70],[w-20,h-90]], land);
+    path = d3.geoPath(projection);
+    return {w:w,h:h};
+  }
+
+  function drawBase(){
+    svg.selectAll("*").remove();
+    var land = topojson.feature(us, us.objects.states);
+    gStates = svg.append("g");
+    gStates.selectAll("path").data(land.features).enter().append("path")
+      .attr("class","state").attr("d", path);
+    gRoutes = svg.append("g");
+    gDC = svg.append("g");
+    gTrucks = svg.append("g");
+    // animated dash defs
+    var defs = svg.append("defs");
+    var f = defs.append("filter").attr("id","soft").attr("x","-40%").attr("y","-40%").attr("width","180%").attr("height","180%");
+    f.append("feDropShadow").attr("dx",0).attr("dy",1).attr("stdDeviation",1.4).attr("flood-color","#142A46").attr("flood-opacity",.35);
+  }
+
+  function render(){
+    if (!us || !projection) return;
+    var pts = rows.map(function(r){
+      var po = projection(r.o), pd = projection(r.d);
+      return {r:r, po:po, pd:pd};
+    }).filter(function(p){ return p.po && p.pd; });
+
+    // routes
+    var routes = gRoutes.selectAll("path.route").data(pts, function(p){ return p.r.id; });
+    routes.exit().remove();
+    routes.enter().append("path")
+      .attr("class", function(p){ return "route "+p.r.cls; })
+      .attr("stroke-width", 1.4)
+      .merge(routes)
+      .attr("d", function(p){
+        var mx=(p.po[0]+p.pd[0])/2, my=(p.po[1]+p.pd[1])/2 - Math.hypot(p.pd[0]-p.po[0],p.pd[1]-p.po[1])*0.14;
+        return "M"+p.po[0]+","+p.po[1]+" Q"+mx+","+my+" "+p.pd[0]+","+p.pd[1];
+      })
+      .attr("stroke-dasharray","2 7")
+      .attr("stroke-dashoffset", -animT*0.6);
+
+    // destination DCs
+    var dcs = gDC.selectAll("circle.dc").data(pts, function(p){ return p.r.id; });
+    dcs.exit().remove();
+    dcs.enter().append("circle").attr("class","dc").attr("r",3.2)
+      .merge(dcs)
+      .attr("cx", function(p){ return p.pd[0]; })
+      .attr("cy", function(p){ return p.pd[1]; })
+      .attr("fill", function(p){ return COLORS[p.r.cls]||COLORS.transit; })
+      .attr("opacity",.55);
+
+    // trucks at eased current progress
+    var trucks = gTrucks.selectAll("g.truck").data(pts, function(p){ return p.r.id; });
+    trucks.exit().remove();
+    var enter = trucks.enter().append("g").attr("class","truck")
+      .on("mousemove", function(ev,p){ showTip(ev,p.r); })
+      .on("mouseleave", hideTip);
+    enter.append("circle").attr("class","truck-halo").attr("r",10);
+    enter.append("circle").attr("class","truck-core").attr("r",4.6).attr("stroke","#fff").attr("stroke-width",1.4).attr("filter","url(#soft)");
+    var ease = Math.min(1, animT/60); // intro glide 0→true progress over ~1s
+    trucks.merge(enter).each(function(p){
+      var g = d3.select(this);
+      var t = p.r.prog * ease;
+      // position along the quadratic curve
+      var mx=(p.po[0]+p.pd[0])/2, my=(p.po[1]+p.pd[1])/2 - Math.hypot(p.pd[0]-p.po[0],p.pd[1]-p.po[1])*0.14;
+      var x = (1-t)*(1-t)*p.po[0] + 2*(1-t)*t*mx + t*t*p.pd[0];
+      var y = (1-t)*(1-t)*p.po[1] + 2*(1-t)*t*my + t*t*p.pd[1];
+      var c = COLORS[p.r.cls]||COLORS.transit;
+      g.select(".truck-halo").attr("cx",x).attr("cy",y).attr("fill",c);
+      g.select(".truck-core").attr("cx",x).attr("cy",y).attr("fill",c);
+    });
+  }
+
+  function tick(){
+    animT += 1;
+    render();
+    raf = requestAnimationFrame(tick);
+  }
+
+  function showTip(ev, r){
+    var col = COLORS[r.cls]||COLORS.transit;
+    var label = r.cls==="delayed"?"Delayed":(r.cls==="soon"?"Arriving soon":"In transit");
+    tip.innerHTML = '<div class="id">'+r.id+'<span class="pill" style="background:'+col+'">'+label+'</span></div>'+
+      '<div class="kv">'+ (r.city?(r.city+", "+r.state):("→ "+r.state)) +'</div>'+
+      '<div class="kv">Carrier: '+r.carrier+'</div>'+
+      '<div class="kv">ETA: '+fmtETA(r.eta)+' · '+Math.round(r.prog*100)+'% complete</div>'+
+      '<div class="kv">'+ (r.units? (r.units.toLocaleString()+" units") : "") + (r.category?(" · "+r.category):"") +'</div>'+
+      '<div class="bar"><i style="width:'+Math.round(r.prog*100)+'%;background:'+col+'"></i></div>';
+    tip.style.opacity=1;
+    var stage=document.getElementById("stage").getBoundingClientRect();
+    var x = ev.clientX-stage.left+14, y = ev.clientY-stage.top+14;
+    if (x> stage.width-260) x = ev.clientX-stage.left-260;
+    tip.style.left=x+"px"; tip.style.top=y+"px";
+  }
+  function hideTip(){ tip.style.opacity=0; }
+
+  function updateHud(){
+    var c={transit:0,soon:0,delayed:0}, units=0, carriers={}, nextEta=Infinity;
+    rows.forEach(function(r){ c[r.cls]=(c[r.cls]||0)+1; units+=r.units; if(r.carrier) carriers[r.carrier]=1;
+      var e=etaMs(r.eta); if(e<nextEta) nextEta=e; });
+    var active = rows.length;
+    document.getElementById("hud-active").textContent = active.toLocaleString();
+    document.getElementById("hud-sub").textContent = active? "trucks on the road right now" : "no active shipments";
+    document.getElementById("lg-transit").textContent = c.transit||0;
+    document.getElementById("lg-soon").textContent = c.soon||0;
+    document.getElementById("lg-delayed").textContent = c.delayed||0;
+    document.getElementById("st-units").textContent = units? (units>=1000? (units/1000).toFixed(1)+"K" : units) : "0";
+    var ontime = active? Math.round(100*(active-(c.delayed||0))/active) : 0;
+    document.getElementById("st-ontime").textContent = ontime+"%";
+    document.getElementById("st-eta").textContent = isFinite(nextEta)? fmtETA(nextEta) : "—";
+    document.getElementById("st-carriers").textContent = Object.keys(carriers).length||0;
+  }
+
+  function redraw(){
+    if (!us) return;
+    fit();
+    drawBase();
+    render();
+    updateHud();
+    msg.style.display = rows.length? "none" : "flex";
+    if (!rows.length) msg.textContent = "No active shipments for this selection.";
+  }
+
+  function apply(cfg, data, cols){
+    lastCfg=cfg; lastData=data; lastCols=cols;
+    rows = buildRows(cfg, data, cols);
+    redraw();
+    if (!raf) tick();
+  }
+
+  // ---- boot: load us-atlas, then wire Sigma ----
+  function boot(){
+    d3.json("us-states-10m.json").then(function(topo){
+      us = topo;
+      redraw();
+      if (lastCfg) apply(lastCfg,lastData,lastCols);
+    }).catch(function(){ msg.textContent="Could not load base map."; });
+
+    if (!client){ msg.textContent="Open inside a Sigma workbook to see live shipments."; return; }
+
+    var unsubData=null, unsubCols=null, curCols=null;
+    client.config.subscribe(function(cfg){
+      if (unsubData){ unsubData(); unsubData=null; }
+      if (unsubCols){ unsubCols(); unsubCols=null; }
+      if (!cfg || !cfg.source){ msg.style.display="flex"; msg.textContent="Select a data source."; return; }
+      unsubCols = client.elements.subscribeToElementColumns(cfg.source, function(c){ curCols=c; });
+      unsubData = client.elements.subscribeToElementData(cfg.source, function(d){ apply(cfg, d, curCols); });
+    });
+  }
+
+  var ro = new ResizeObserver(function(){ if (us) redraw(); });
+  ro.observe(document.getElementById("stage"));
+  window.addEventListener("resize", function(){ if (us) redraw(); });
+
+  if (document.readyState!=="loading") boot(); else document.addEventListener("DOMContentLoaded", boot);
+})();
+</script>
+</body>
+</html>
