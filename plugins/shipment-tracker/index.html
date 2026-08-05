@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Live Shipment Tracker</title>
-<script crossorigin src="react.production.min.js"></script>
+<script src="react.production.min.js"></script>
 <script src="sigmacomputing-plugin.umd.js"></script>
 <script src="d3.min.js"></script>
 <script src="topojson-client.min.js"></script>
@@ -292,7 +292,7 @@
     if (!raf) tick();
   }
 
-  // ---- boot: load us-atlas, then wire Sigma ----
+  // ---- boot: load the vendored state topology, then wire Sigma ----
   function boot(){
     d3.json("us-states-10m.json").then(function(topo){
       us = topo;
